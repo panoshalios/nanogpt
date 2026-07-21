@@ -1,5 +1,8 @@
 # "Performs byte pair encoding"
 
+import json
+from pathlib import Path
+
 
 class GPT2Tokenizer:
     def __init__(self):
@@ -26,9 +29,10 @@ class GPT2Tokenizer:
         while len(tokens) >= 2:
             frequency_table = self._get_frequency_table(tokens)
 
-            # Return the pair with the lowest value in the pairs_to_replace dictionary. Which token merge is first
+            # Select the earliest learned merge that appears in the tokens.
             pair_to_merge = min(
-                frequency_table, key=lambda pair: self.pairs_to_replace.get(pair, float("inf"))
+                frequency_table,
+                key=lambda pair: self.pairs_to_replace.get(pair, float("inf")),
             )
             if pair_to_merge not in self.pairs_to_replace:
                 break
@@ -42,6 +46,28 @@ class GPT2Tokenizer:
         byte_sequence = b"".join(map(lambda token: self.vocab[token], tokens))
         text = byte_sequence.decode("utf-8", errors="replace")
         return text
+
+    def save(self, path: str | Path) -> None:
+        data = {
+            "max_vocab_size": self.max_vocab_size,
+            "merges": [
+                [token1, token2, replacement]
+                for (token1, token2), replacement in self.pairs_to_replace.items()
+            ],
+        }
+        Path(path).write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    @classmethod
+    def load(cls, path: str | Path) -> "GPT2Tokenizer":
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+
+        tokenizer = cls()
+        tokenizer.max_vocab_size = data["max_vocab_size"]
+        tokenizer.pairs_to_replace = {
+            (token1, token2): replacement for token1, token2, replacement in data["merges"]
+        }
+        tokenizer.vocab = tokenizer._build_vocab()
+        return tokenizer
 
     # "Learn the vocabulary and the byte pair encoding from the texts"
     def train(self, text: str, max_vocab_size: int) -> dict[tuple[int, int], int]:
@@ -79,8 +105,8 @@ class GPT2Tokenizer:
 
         print("Pair to replacement: ", pair_to_replace)
         print("Int sequence: ", int_sequence)
-        self.vocab = self._build_vocab()
         self.pairs_to_replace = pair_to_replace
+        self.vocab = self._build_vocab()
         self.max_vocab_size = max_vocab_size
         return pair_to_replace
 
