@@ -67,3 +67,7 @@ wandb/
 data/
 checkpoints/
 runs/
+
+# Input and output data
+input/*/*.txt
+output/*/*.txt
