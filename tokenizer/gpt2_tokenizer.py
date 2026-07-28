@@ -103,8 +103,6 @@ class GPT2Tokenizer:
             num_merges += 1
             byte_to_replace += 1
 
-        print("Pair to replacement: ", pair_to_replace)
-        print("Int sequence: ", int_sequence)
         self.pairs_to_replace = pair_to_replace
         self.vocab = self._build_vocab()
         self.max_vocab_size = max_vocab_size
@@ -146,12 +144,12 @@ class GPT2Tokenizer:
         return pair_count
 
 
-test_text = "Hello, world! My nane is Panos"
+# test_text = "Hello, world! My nane is Panos"
 
-tokenizer = GPT2Tokenizer()
-tokenizer.train(test_text, 266)
-tokenized_text = tokenizer.tokenize(test_text)
-detokenized_text = tokenizer.detokenize(tokenized_text)
-print(f"[GPT2Tokenizer.test] Tokenized text: {tokenized_text}")
-print(f"[GPT2Tokenizer.test] Detokenized text: {detokenized_text}")
-print(f"Tokenized text matches original text: {detokenized_text == test_text}")
+# tokenizer = GPT2Tokenizer()
+# tokenizer.train(test_text, 266)
+# tokenized_text = tokenizer.tokenize(test_text)
+# detokenized_text = tokenizer.detokenize(tokenized_text)
+# print(f"[GPT2Tokenizer.test] Tokenized text: {tokenized_text}")
+# print(f"[GPT2Tokenizer.test] Detokenized text: {detokenized_text}")
+# print(f"Tokenized text matches original text: {detokenized_text == test_text}")
