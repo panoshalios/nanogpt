@@ -20,7 +20,7 @@ class SimpleSingleHeadAttention(nn.Module):
         self.register_buffer(
             "bias",
             torch.tril(torch.ones(config.block_size, config.block_size)).view(
-                1, 1, config.block_size, config.block_size
+                1, config.block_size, config.block_size
             ),
         )
         self.attn_dropout = nn.Dropout(config.dropout)
@@ -32,7 +32,7 @@ class SimpleSingleHeadAttention(nn.Module):
         query = self.query_att(x)
         value = self.value_att(x)
         attn = (query @ key.transpose(-2, -1)) * (1 / math.sqrt(self.head_size))  # (B, T, T)
-        attn = attn.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
+        attn = attn.masked_fill(self.bias[:, :T, :T] == 0, float("-inf"))
         attn = F.softmax(attn, dim=-1)
         attn = self.attn_dropout(attn)
         y = attn @ value
@@ -108,11 +108,13 @@ class CausalSelfAttention(nn.Module):
         )  # (B, n_head, T, head_size) @ (B, n_head, head_size, T) = (B, n_head, T, T)
         attn = attn.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))  # (B, n_head, T, T)
         attn = F.softmax(attn, dim=-1)  # (B, n_head, T, T)
+        attn = self.attn_dropout(attn)
 
         # output of attention
         y = attn @ v
 
-        # transpose back to (B, T, n_head, head_size). Contiguous is used to make the tensor contiguous in memory.
+        # Transpose back to (B, T, n_head, head_size), then make the
+        # tensor contiguous before reshaping it.
         y = y.transpose(1, 2).contiguous().view(B, T, C)
 
         y = self.resid_dropout(self.c_proj(y))
