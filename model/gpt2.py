@@ -70,6 +70,22 @@ class GPT2(nn.Module):
         # initialize all weights
         self.apply(self._init_weights)
 
+    def num_parameters(self, trainable_only: bool = False) -> int:
+        """Return the number of unique model parameters."""
+        parameters = (
+            (parameter for parameter in self.parameters() if parameter.requires_grad)
+            if trainable_only
+            else self.parameters()
+        )
+        return sum(parameter.numel() for parameter in parameters)
+
+    def model_size_bytes(self, include_buffers: bool = True) -> int:
+        """Return the memory required to store the model tensors in their current dtypes."""
+        size = sum(parameter.numel() * parameter.element_size() for parameter in self.parameters())
+        if include_buffers:
+            size += sum(buffer.numel() * buffer.element_size() for buffer in self.buffers())
+        return size
+
     def forward(self, idx: torch.Tensor, targets=None):
         device = idx.device
         b, t = idx.shape

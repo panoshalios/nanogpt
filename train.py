@@ -40,7 +40,7 @@ def main() -> None:
     use_bfloat16 = supports_bfloat16(device)
     config = GPT2Config(vocab_size=VOCAB_SIZE)
     model = GPT2(config).to(device)
-    model = torch.compile(model)
+    # model = torch.compile(model)
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 
     # Pinned memory enables non-blocking CPU-to-CUDA transfers. It is not used
