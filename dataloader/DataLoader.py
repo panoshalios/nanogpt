@@ -5,7 +5,13 @@ import torch
 
 
 class DataLoader:
-    """Load fixed-length, next-token prediction batches from a uint16 file."""
+    """Load fixed-length, next-token prediction batches from a uint16 file.
+
+    With shuffle=True, every sample starts at a uniformly random token offset, so
+    each epoch sees different windows of the data. With shuffle=False, samples are
+    consecutive non-overlapping chunks in file order, which is deterministic and
+    suited to evaluation.
+    """
 
     def __init__(
         self,
@@ -33,6 +39,7 @@ class DataLoader:
         self._tokens = np.memmap(self.file_path, dtype=np.uint16, mode="r")
 
         # Each sample needs block_size input tokens and one following target.
+        # An epoch covers roughly one pass over the tokens in either mode.
         self.num_samples = (len(self._tokens) - 1) // block_size
         self.num_batches = self.num_samples // batch_size
         if self.num_batches == 0:
@@ -42,37 +49,36 @@ class DataLoader:
                 f"at least {required} are required for one batch"
             )
 
-        self._sample_indices = np.arange(self.num_samples)
+        # Largest valid start so that start + block_size is still a valid target index.
+        self._max_start = len(self._tokens) - block_size - 1
+        self._offsets = np.arange(block_size + 1)
         self._batch_index = 0
-        self._reset()
-
-    def _reset(self) -> None:
-        self._batch_index = 0
-        if self.shuffle:
-            self._rng.shuffle(self._sample_indices)
 
     def __len__(self) -> int:
         return self.num_batches
 
     def __iter__(self):
-        self._reset()
+        self._batch_index = 0
         return self
+
+    def _batch_starts(self) -> np.ndarray:
+        if self.shuffle:
+            return self._rng.integers(0, self._max_start + 1, size=self.batch_size)
+        first = self._batch_index * self.batch_size
+        return np.arange(first, first + self.batch_size) * self.block_size
 
     def __next__(self) -> tuple[torch.Tensor, torch.Tensor]:
         if self._batch_index >= self.num_batches:
             raise StopIteration
 
-        first = self._batch_index * self.batch_size
-        sample_indices = self._sample_indices[first : first + self.batch_size]
-        starts = sample_indices * self.block_size
-
-        x = np.stack([self._tokens[start : start + self.block_size] for start in starts])
-        y = np.stack([self._tokens[start + 1 : start + self.block_size + 1] for start in starts])
+        starts = self._batch_starts()
+        # (batch_size, block_size + 1) window; x and y are its two overlapping views.
+        window = self._tokens[starts[:, None] + self._offsets].astype(np.int64)
         self._batch_index += 1
 
         # Embedding indices and cross-entropy targets must be torch.long.
-        x_tensor = torch.from_numpy(x.astype(np.int64))
-        y_tensor = torch.from_numpy(y.astype(np.int64))
+        x_tensor = torch.from_numpy(window[:, :-1].copy())
+        y_tensor = torch.from_numpy(window[:, 1:].copy())
         if self.pin_memory:
             x_tensor = x_tensor.pin_memory()
             y_tensor = y_tensor.pin_memory()
