@@ -35,9 +35,20 @@ def supports_bfloat16(device: torch.device) -> bool:
     return False
 
 
+def supports_tf32(device: torch.device) -> bool:
+    # TF32 tensor cores exist on Ampere (compute capability 8.0) and newer.
+    if device.type != "cuda":
+        return False
+    major, _ = torch.cuda.get_device_capability(device)
+    return major >= 8
+
+
 def main() -> None:
     device = get_device()
     use_bfloat16 = supports_bfloat16(device)
+    use_tf32 = supports_tf32(device)
+    # "high" runs float32 matmuls in TF32. Everything else stays in full float32.
+    torch.set_float32_matmul_precision("high" if use_tf32 else "highest")
     config = GPT2Config(vocab_size=VOCAB_SIZE)
     model = GPT2(config).to(device)
     # model = torch.compile(model)
@@ -55,7 +66,8 @@ def main() -> None:
     )
 
     precision = "bfloat16 mixed precision" if use_bfloat16 else "float32"
-    print(f"Using device: {device} ({precision})")
+    matmul = "tf32" if use_tf32 else "fp32"
+    print(f"Using device: {device} ({precision}, {matmul} matmul)")
     for epoch in range(EPOCHS):
         model.train()
         total_loss = torch.zeros((), device=device)
@@ -67,20 +79,28 @@ def main() -> None:
             y = y.to(device, non_blocking=pin_memory)
 
             optimizer.zero_grad(set_to_none=True)
+
             with torch.autocast(
                 device_type=device.type,
                 dtype=torch.bfloat16,
                 enabled=use_bfloat16,
             ):
                 _, loss = model(x, y)
+
             loss.backward()
             optimizer.step()
             total_loss += loss.detach()
 
         synchronize(device)
+
         elapsed = time.perf_counter() - start_time
         average_loss = (total_loss / len(data_loader)).item()
-        print(f"Epoch {epoch + 1}: loss={average_loss:.4f}, time={elapsed:.2f}s")
+        num_tokens = len(data_loader) * BATCH_SIZE * config.block_size
+        tokens_per_second = num_tokens / elapsed if elapsed > 0 else float("inf")
+        print(
+            f"Epoch {epoch + 1}: loss={average_loss:.4f}, time={elapsed:.2f}s, \
+            throughput={tokens_per_second:.2f} tokens/s"
+        )
 
 
 if __name__ == "__main__":
