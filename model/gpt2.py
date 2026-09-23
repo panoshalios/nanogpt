@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from layers.attention import MultiHeadAttention
+from layers.attention import FlashCausalSelfAttention
 from layers.layer_norm import LayerNorm
 
 
@@ -40,7 +40,8 @@ class TransformerBlock(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.layer_norm1 = LayerNorm(config.n_embd, config.bias)
-        self.heads = MultiHeadAttention(config)  # Can swap out with CausalSelfAttention
+        # Can swap out with MultiHeadAttention or CausalSelfAttention from layers.attention
+        self.heads = FlashCausalSelfAttention(config)
         self.layer_norm2 = LayerNorm(config.n_embd, config.bias)
         self.mlp = MLP(config)
 

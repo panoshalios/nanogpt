@@ -75,7 +75,6 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
         self.dropout = config.dropout
 
-        # TODO replace with flash attention
         # What does .tril do?
         # It creates a lower triangular matrix with ones on the diagonal
 
@@ -112,6 +111,64 @@ class CausalSelfAttention(nn.Module):
 
         # output of attention
         y = attn @ v
+
+        # Transpose back to (B, T, n_head, head_size), then make the
+        # tensor contiguous before reshaping it.
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+
+        y = self.resid_dropout(self.c_proj(y))
+
+        return y
+
+
+class FlashCausalSelfAttention(nn.Module):
+    """Same as CausalSelfAttention, but the attention step uses a fused kernel.
+
+    F.scaled_dot_product_attention picks FlashAttention on supported GPUs. It computes
+    softmax(q @ k^T / sqrt(head_size)) @ v in tiles without ever storing the full
+    (B, n_head, T, T) attention matrix, so it needs no causal mask buffer.
+    """
+
+    def __init__(self, config: "GPT2Config"):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+        # key, query, value projections for all heads, in one linear layer
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        # output projection
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+
+        # Attention dropout is applied inside scaled_dot_product_attention via dropout_p
+        self.resid_dropout = nn.Dropout(config.dropout)
+
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.dropout = config.dropout
+
+        # No "bias" mask buffer: is_causal=True applies the causal mask inside the kernel.
+
+    def forward(self, x):
+        B, T, C = x.size()
+
+        query_key_value = self.c_attn(x)
+        query, key, value = query_key_value.split(self.n_embd, dim=2)
+        head_size = C // self.n_head
+        q = query.view(B, T, self.n_head, head_size).transpose(1, 2)  # (B, n_head, T, head_size)
+        k = key.view(B, T, self.n_head, head_size).transpose(1, 2)  # (B, n_head, T, head_size)
+        v = value.view(B, T, self.n_head, head_size).transpose(1, 2)  # (B, n_head, T, head_size)
+
+        # Replaces these five lines of CausalSelfAttention with one fused kernel:
+        #   attn = (q @ k.transpose(-2, -1)) * (1 / math.sqrt(head_size))
+        #   attn = attn.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
+        #   attn = F.softmax(attn, dim=-1)
+        #   attn = self.attn_dropout(attn)
+        #   y = attn @ v
+        y = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            is_causal=True,
+            dropout_p=self.dropout if self.training else 0.0,
+        )  # (B, n_head, T, head_size)
 
         # Transpose back to (B, T, n_head, head_size), then make the
         # tensor contiguous before reshaping it.
