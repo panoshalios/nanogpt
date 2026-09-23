@@ -6,9 +6,9 @@ import torch
 from dataloader import DataLoader
 from model.gpt2 import GPT2, GPT2Config
 
-EPOCHS = 10
+EPOCHS = 50
 BATCH_SIZE = 16
-VOCAB_SIZE = 400
+VOCAB_SIZE = 1024
 TRAIN_DATA = Path(__file__).parent / "input" / "shakespeare" / "train.bin"
 
 
@@ -51,8 +51,10 @@ def main() -> None:
     torch.set_float32_matmul_precision("high" if use_tf32 else "highest")
     config = GPT2Config(vocab_size=VOCAB_SIZE)
     model = GPT2(config).to(device)
-    # model = torch.compile(model)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+    model = torch.compile(model)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8, fused=device.type == "cuda"
+    )
 
     # Pinned memory enables non-blocking CPU-to-CUDA transfers. It is not used
     # for CPU or MPS because those backends do not benefit from CUDA pinning.
@@ -88,6 +90,10 @@ def main() -> None:
                 _, loss = model(x, y)
 
             loss.backward()
+
+            # Clip gradient norm
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
             optimizer.step()
             total_loss += loss.detach()
 

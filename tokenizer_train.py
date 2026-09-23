@@ -4,7 +4,7 @@ from tokenizer import GPT2Tokenizer
 
 def main():
     tokenizer = GPT2Tokenizer()
-    max_vocab_size = 400
+    max_vocab_size = 1024
     input_path = "input/shakespeare/input.txt"
     output_path = "output/shakespeare_tokenizer.json"
 
