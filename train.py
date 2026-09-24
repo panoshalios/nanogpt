@@ -1,4 +1,3 @@
-import math
 import time
 from pathlib import Path
 
@@ -6,6 +5,14 @@ import torch
 
 from dataloader import DataLoader
 from model.gpt2 import GPT2, GPT2Config
+from train_utils import (
+    create_optimizer,
+    get_device,
+    get_lr,
+    supports_bfloat16,
+    supports_tf32,
+    synchronize,
+)
 
 VOCAB_SIZE = 1024
 TRAIN_DATA = Path(__file__).parent / "input" / "shakespeare" / "train.bin"
@@ -27,76 +34,6 @@ WARMUP_STEPS = 715  # GPT-3 warms up over 375M tokens: 375e6 / 524_288 ~= 715 st
 WEIGHT_DECAY = 0.1
 
 
-def get_device() -> torch.device:
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
-
-
-def synchronize(device: torch.device) -> None:
-    if device.type == "cuda":
-        torch.cuda.synchronize()
-    elif device.type == "mps":
-        torch.mps.synchronize()
-
-
-def supports_bfloat16(device: torch.device) -> bool:
-    if device.type == "cuda":
-        return torch.cuda.is_bf16_supported()
-    if device.type == "mps":
-        return torch.backends.mps.is_macos_or_newer(14, 0)
-    return False
-
-
-def supports_tf32(device: torch.device) -> bool:
-    # TF32 tensor cores exist on Ampere (compute capability 8.0) and newer.
-    if device.type != "cuda":
-        return False
-    major, _ = torch.cuda.get_device_capability(device)
-    return major >= 8
-
-
-def get_lr(step: int, max_steps: int) -> float:
-    # 1) Linear warmup from near zero up to MAX_LR.
-    if step < WARMUP_STEPS:
-        return MAX_LR * (step + 1) / WARMUP_STEPS
-    # 2) After decay finishes, hold at MIN_LR.
-    if step >= max_steps:
-        return MIN_LR
-    # 3) In between, cosine decay from MAX_LR down to MIN_LR.
-    decay_ratio = (step - WARMUP_STEPS) / (max_steps - WARMUP_STEPS)
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))  # goes 1 -> 0
-    return MIN_LR + coeff * (MAX_LR - MIN_LR)
-
-
-def create_optimizer(model: torch.nn.Module, device: torch.device) -> torch.optim.AdamW:
-    # GPT-3 style weight decay: only 2D parameters (Linear weights and embeddings) are
-    # decayed. 1D parameters (biases and LayerNorm weights) are not. Decaying them only
-    # pulls them toward zero without regularizing anything useful.
-    # parameters() yields the tied embedding / output weight only once.
-    params = [p for p in model.parameters() if p.requires_grad]
-    decay_params = [p for p in params if p.dim() >= 2]
-    no_decay_params = [p for p in params if p.dim() < 2]
-    param_groups = [
-        {"params": decay_params, "weight_decay": WEIGHT_DECAY},
-        {"params": no_decay_params, "weight_decay": 0.0},
-    ]
-    num_decay = sum(p.numel() for p in decay_params)
-    num_no_decay = sum(p.numel() for p in no_decay_params)
-    print(f"Decayed params: {len(decay_params)} tensors, {num_decay:,} values")
-    print(f"Non-decayed params: {len(no_decay_params)} tensors, {num_no_decay:,} values")
-
-    return torch.optim.AdamW(
-        param_groups,
-        lr=MAX_LR,
-        betas=(0.9, 0.95),
-        eps=1e-8,
-        fused=device.type == "cuda",
-    )
-
-
 def main() -> None:
     device = get_device()
     use_bfloat16 = supports_bfloat16(device)
@@ -106,7 +43,7 @@ def main() -> None:
     config = GPT2Config(vocab_size=VOCAB_SIZE)
     model = GPT2(config).to(device)
     model = torch.compile(model)
-    optimizer = create_optimizer(model, device)
+    optimizer = create_optimizer(model, device, lr=MAX_LR, weight_decay=WEIGHT_DECAY)
 
     # Pinned memory enables non-blocking CPU-to-CUDA transfers. It is not used
     # for CPU or MPS because those backends do not benefit from CUDA pinning.
@@ -164,7 +101,7 @@ def main() -> None:
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
         # Set this step's learning rate before the optimizer uses it.
-        lr = get_lr(step, MAX_STEPS)
+        lr = get_lr(step, MAX_STEPS, WARMUP_STEPS, MAX_LR, MIN_LR)
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
 
