@@ -73,7 +73,12 @@ def main() -> None:
     model = GPT2(config).to(device)
     model = torch.compile(model)
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=MAX_LR, betas=(0.9, 0.95), eps=1e-8, fused=device.type == "cuda"
+        model.parameters(),
+        lr=MAX_LR,
+        betas=(0.9, 0.95),
+        eps=1e-8,
+        fused=device.type == "cuda",
+        weight_decay=0.1,
     )
 
     # Pinned memory enables non-blocking CPU-to-CUDA transfers. It is not used
