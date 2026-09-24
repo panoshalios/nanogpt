@@ -7,16 +7,23 @@ import torch
 from dataloader import DataLoader
 from model.gpt2 import GPT2, GPT2Config
 
-EPOCHS = 50
-BATCH_SIZE = 16
 VOCAB_SIZE = 1024
 TRAIN_DATA = Path(__file__).parent / "input" / "shakespeare" / "train.bin"
+
+# GPT-3 Small trains with ~0.5M tokens per optimizer step (GPT-3 paper, Table 2.1).
+# That does not fit on the GPU at once, so each step accumulates gradients over
+# several micro-batches of MICRO_BATCH_SIZE sequences of block_size tokens.
+TOTAL_BATCH_SIZE = 524_288  # 2**19 tokens per optimizer step
+MICRO_BATCH_SIZE = 16  # sequences per forward/backward pass
+
+# Training length in optimizer steps. 19_073 steps * 524_288 tokens ~= 10B tokens.
+MAX_STEPS = 19_073
 
 # GPT-3 learning rate schedule (GPT-3 paper, Appendix B): linear warmup, then cosine
 # decay down to 10% of the peak. MAX_LR is the value used for GPT-3 Small (125M).
 MAX_LR = 6e-4
 MIN_LR = MAX_LR * 0.1
-WARMUP_STEPS = 50
+WARMUP_STEPS = 715  # GPT-3 warms up over 375M tokens: 375e6 / 524_288 ~= 715 steps
 WEIGHT_DECAY = 0.1
 
 
@@ -106,30 +113,38 @@ def main() -> None:
     pin_memory = device.type == "cuda"
     data_loader = DataLoader(
         TRAIN_DATA,
-        batch_size=BATCH_SIZE,
+        batch_size=MICRO_BATCH_SIZE,
         block_size=config.block_size,
         shuffle=True,
         pin_memory=pin_memory,
     )
 
+    tokens_per_micro_batch = MICRO_BATCH_SIZE * config.block_size
+    assert TOTAL_BATCH_SIZE % tokens_per_micro_batch == 0, (
+        "TOTAL_BATCH_SIZE must be divisible by MICRO_BATCH_SIZE * block_size"
+    )
+    grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_micro_batch
+
     precision = "bfloat16 mixed precision" if use_bfloat16 else "float32"
     matmul = "tf32" if use_tf32 else "fp32"
     print(f"Using device: {device} ({precision}, {matmul} matmul)")
+    print(
+        f"Batch: {TOTAL_BATCH_SIZE:,} tokens/step = {grad_accum_steps} micro-batches "
+        f"of {MICRO_BATCH_SIZE} x {config.block_size}"
+    )
 
-    # The schedule is defined over optimizer steps, and the decay spans the whole run.
-    max_steps = EPOCHS * len(data_loader)
-    step = 0
-    for epoch in range(EPOCHS):
-        model.train()
-        total_loss = torch.zeros((), device=device)
+    model.train()
+    for step in range(MAX_STEPS):
         synchronize(device)
         start_time = time.perf_counter()
 
-        for x, y in data_loader:
+        optimizer.zero_grad(set_to_none=True)
+        loss_accum = torch.zeros((), device=device)
+
+        for _ in range(grad_accum_steps):
+            x, y = data_loader.next_batch()
             x = x.to(device, non_blocking=pin_memory)
             y = y.to(device, non_blocking=pin_memory)
-
-            optimizer.zero_grad(set_to_none=True)
 
             with torch.autocast(
                 device_type=device.type,
@@ -138,28 +153,29 @@ def main() -> None:
             ):
                 _, loss = model(x, y)
 
+            # The loss is a mean over one micro-batch. backward() adds gradients
+            # together, so divide by grad_accum_steps to get the mean over the
+            # full batch, which is what one big batch would have produced.
+            loss = loss / grad_accum_steps
+            loss_accum += loss.detach()
             loss.backward()
 
-            # Clip gradient norm
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        # Clip gradient norm (of the full-batch gradient)
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
-            # Set this step's learning rate before the optimizer uses it.
-            lr = get_lr(step, max_steps)
-            for param_group in optimizer.param_groups:
-                param_group["lr"] = lr
+        # Set this step's learning rate before the optimizer uses it.
+        lr = get_lr(step, MAX_STEPS)
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = lr
 
-            optimizer.step()
-            step += 1
-            total_loss += loss.detach()
-
+        optimizer.step()
         synchronize(device)
 
         elapsed = time.perf_counter() - start_time
-        average_loss = (total_loss / len(data_loader)).item()
-        num_tokens = len(data_loader) * BATCH_SIZE * config.block_size
-        tokens_per_second = num_tokens / elapsed if elapsed > 0 else float("inf")
+        tokens_per_second = TOTAL_BATCH_SIZE / elapsed if elapsed > 0 else float("inf")
         print(
-            f"Epoch {epoch + 1}: loss={average_loss:.4f}, lr={lr:.2e}, time={elapsed:.2f}s, "
+            f"Step {step + 1}/{MAX_STEPS}: loss={loss_accum.item():.4f}, lr={lr:.2e}, "
+            f"norm={norm.item():.4f}, time={elapsed:.2f}s, "
             f"throughput={tokens_per_second:.2f} tokens/s"
         )
 

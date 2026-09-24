@@ -85,4 +85,7 @@ class DataLoader:
         return x_tensor, y_tensor
 
     def next_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the next batch, starting a new pass over the data when one ends."""
+        if self._batch_index >= self.num_batches:
+            self._batch_index = 0
         return next(self)
