@@ -1,3 +1,4 @@
+import math
 import time
 from pathlib import Path
 
@@ -10,6 +11,12 @@ EPOCHS = 50
 BATCH_SIZE = 16
 VOCAB_SIZE = 1024
 TRAIN_DATA = Path(__file__).parent / "input" / "shakespeare" / "train.bin"
+
+# GPT-3 learning rate schedule (GPT-3 paper, Appendix B): linear warmup, then cosine
+# decay down to 10% of the peak. MAX_LR is the value used for GPT-3 Small (125M).
+MAX_LR = 6e-4
+MIN_LR = MAX_LR * 0.1
+WARMUP_STEPS = 50
 
 
 def get_device() -> torch.device:
@@ -43,6 +50,19 @@ def supports_tf32(device: torch.device) -> bool:
     return major >= 8
 
 
+def get_lr(step: int, max_steps: int) -> float:
+    # 1) Linear warmup from near zero up to MAX_LR.
+    if step < WARMUP_STEPS:
+        return MAX_LR * (step + 1) / WARMUP_STEPS
+    # 2) After decay finishes, hold at MIN_LR.
+    if step >= max_steps:
+        return MIN_LR
+    # 3) In between, cosine decay from MAX_LR down to MIN_LR.
+    decay_ratio = (step - WARMUP_STEPS) / (max_steps - WARMUP_STEPS)
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))  # goes 1 -> 0
+    return MIN_LR + coeff * (MAX_LR - MIN_LR)
+
+
 def main() -> None:
     device = get_device()
     use_bfloat16 = supports_bfloat16(device)
@@ -53,7 +73,7 @@ def main() -> None:
     model = GPT2(config).to(device)
     model = torch.compile(model)
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8, fused=device.type == "cuda"
+        model.parameters(), lr=MAX_LR, betas=(0.9, 0.95), eps=1e-8, fused=device.type == "cuda"
     )
 
     # Pinned memory enables non-blocking CPU-to-CUDA transfers. It is not used
@@ -70,6 +90,10 @@ def main() -> None:
     precision = "bfloat16 mixed precision" if use_bfloat16 else "float32"
     matmul = "tf32" if use_tf32 else "fp32"
     print(f"Using device: {device} ({precision}, {matmul} matmul)")
+
+    # The schedule is defined over optimizer steps, and the decay spans the whole run.
+    max_steps = EPOCHS * len(data_loader)
+    step = 0
     for epoch in range(EPOCHS):
         model.train()
         total_loss = torch.zeros((), device=device)
@@ -94,7 +118,13 @@ def main() -> None:
             # Clip gradient norm
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
+            # Set this step's learning rate before the optimizer uses it.
+            lr = get_lr(step, max_steps)
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = lr
+
             optimizer.step()
+            step += 1
             total_loss += loss.detach()
 
         synchronize(device)
@@ -104,8 +134,8 @@ def main() -> None:
         num_tokens = len(data_loader) * BATCH_SIZE * config.block_size
         tokens_per_second = num_tokens / elapsed if elapsed > 0 else float("inf")
         print(
-            f"Epoch {epoch + 1}: loss={average_loss:.4f}, time={elapsed:.2f}s, \
-            throughput={tokens_per_second:.2f} tokens/s"
+            f"Epoch {epoch + 1}: loss={average_loss:.4f}, lr={lr:.2e}, time={elapsed:.2f}s, "
+            f"throughput={tokens_per_second:.2f} tokens/s"
         )
 
 
