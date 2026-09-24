@@ -17,6 +17,7 @@ TRAIN_DATA = Path(__file__).parent / "input" / "shakespeare" / "train.bin"
 MAX_LR = 6e-4
 MIN_LR = MAX_LR * 0.1
 WARMUP_STEPS = 50
+WEIGHT_DECAY = 0.1
 
 
 def get_device() -> torch.device:
@@ -63,6 +64,32 @@ def get_lr(step: int, max_steps: int) -> float:
     return MIN_LR + coeff * (MAX_LR - MIN_LR)
 
 
+def create_optimizer(model: torch.nn.Module, device: torch.device) -> torch.optim.AdamW:
+    # GPT-3 style weight decay: only 2D parameters (Linear weights and embeddings) are
+    # decayed. 1D parameters (biases and LayerNorm weights) are not. Decaying them only
+    # pulls them toward zero without regularizing anything useful.
+    # parameters() yields the tied embedding / output weight only once.
+    params = [p for p in model.parameters() if p.requires_grad]
+    decay_params = [p for p in params if p.dim() >= 2]
+    no_decay_params = [p for p in params if p.dim() < 2]
+    param_groups = [
+        {"params": decay_params, "weight_decay": WEIGHT_DECAY},
+        {"params": no_decay_params, "weight_decay": 0.0},
+    ]
+    num_decay = sum(p.numel() for p in decay_params)
+    num_no_decay = sum(p.numel() for p in no_decay_params)
+    print(f"Decayed params: {len(decay_params)} tensors, {num_decay:,} values")
+    print(f"Non-decayed params: {len(no_decay_params)} tensors, {num_no_decay:,} values")
+
+    return torch.optim.AdamW(
+        param_groups,
+        lr=MAX_LR,
+        betas=(0.9, 0.95),
+        eps=1e-8,
+        fused=device.type == "cuda",
+    )
+
+
 def main() -> None:
     device = get_device()
     use_bfloat16 = supports_bfloat16(device)
@@ -72,14 +99,7 @@ def main() -> None:
     config = GPT2Config(vocab_size=VOCAB_SIZE)
     model = GPT2(config).to(device)
     model = torch.compile(model)
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=MAX_LR,
-        betas=(0.9, 0.95),
-        eps=1e-8,
-        fused=device.type == "cuda",
-        weight_decay=0.1,
-    )
+    optimizer = create_optimizer(model, device)
 
     # Pinned memory enables non-blocking CPU-to-CUDA transfers. It is not used
     # for CPU or MPS because those backends do not benefit from CUDA pinning.
