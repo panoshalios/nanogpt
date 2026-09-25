@@ -47,6 +47,8 @@ class MultiHeadAttention(nn.Module):
             [SimpleSingleHeadAttention(config) for _ in range(config.n_head)]
         )
         self.proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        # Writes into the residual stream; GPT2._init_weights scales its init down.
+        self.proj.is_residual_projection = True
 
     def forward(self, x):
         y = torch.cat([head(x) for head in self.heads], dim=-1)
@@ -67,6 +69,8 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        # Writes into the residual stream; GPT2._init_weights scales its init down.
+        self.c_proj.is_residual_projection = True
 
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
@@ -136,6 +140,8 @@ class FlashCausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        # Writes into the residual stream; GPT2._init_weights scales its init down.
+        self.c_proj.is_residual_projection = True
 
         # Attention dropout is applied inside scaled_dot_product_attention via dropout_p
         self.resid_dropout = nn.Dropout(config.dropout)

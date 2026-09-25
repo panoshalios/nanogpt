@@ -26,6 +26,8 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, expand_dim, bias=config.bias)
         self.gelu = nn.GELU()
         self.c_proj = nn.Linear(expand_dim, config.n_embd, bias=config.bias)
+        # Writes into the residual stream; GPT2._init_weights scales its init down.
+        self.c_proj.is_residual_projection = True
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
@@ -62,7 +64,9 @@ class GPT2(nn.Module):
             *[TransformerBlock(config) for _ in range(config.n_layer)],
         )
         self.layer_norm = LayerNorm(config.n_embd, config.bias)
-        self.linear_layer = nn.Linear(config.n_embd, config.vocab_size, bias=config.bias)
+        # No bias, as in GPT-2: the output layer is tied to the token embedding, which has
+        # no bias either. This also keeps the model convertible to Hugging Face's GPT-2.
+        self.linear_layer = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
         # The the final linear layer shares weights with the token embedding layer
         # https://paperswithcode.com/method/weight-tying
@@ -118,7 +122,10 @@ class GPT2(nn.Module):
         return logits, loss
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, num_valid_tokens=None):
+        # num_valid_tokens: only sample ids below this. The vocabulary is padded past the
+        # tokenizer's size (e.g. 50,304 vs 50,257) for faster matmuls; the padding ids
+        # have no text, so they must never be sampled.
 
         for _ in range(max_new_tokens):
             # crop length to block size
@@ -129,6 +136,8 @@ class GPT2(nn.Module):
             logits, _ = self(idx_cond)
             # Get the last position in sequence. Scale by temperature
             logits = logits[:, -1, :] / temperature
+            if num_valid_tokens is not None:
+                logits[:, num_valid_tokens:] = -float("inf")
 
             if top_k is not None:
                 values, indices = torch.topk(logits, top_k)
@@ -142,7 +151,14 @@ class GPT2(nn.Module):
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            std = 0.02
+            if getattr(module, "is_residual_projection", False):
+                # GPT-2 scaled init: every block adds two branches (attention and MLP) onto
+                # the residual stream, so its variance grows with 2 * n_layer added terms.
+                # Scaling these layers' std by 1/sqrt(2 * n_layer) keeps the stream's scale
+                # at initialization the same no matter how deep the model is.
+                std *= (2 * self.config.n_layer) ** -0.5
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
