@@ -1,8 +1,10 @@
-"""Device, distributed, learning rate schedule and optimizer helpers used by train.py."""
+"""Device, distributed, logging, learning rate schedule and optimizer helpers for train.py."""
 
+import json
 import math
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
@@ -61,6 +63,33 @@ def setup_distributed() -> DistributedContext:
 def cleanup_distributed(ctx: DistributedContext) -> None:
     if ctx.enabled:
         dist.destroy_process_group()
+
+
+class MetricsLogger:
+    """Appends one JSON object per line (JSON Lines) to a log file.
+
+    Load it with pandas.read_json(path, lines=True), or follow it live with tail -f.
+    Pass path=None on non-master ranks to make every call a no-op, so each record is
+    written once.
+    """
+
+    def __init__(self, path: Path | None):
+        self.path = path
+        self._file = None
+        if path is not None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            # Line buffered: every record reaches the OS as soon as it is written, so a
+            # crash or a terminated instance loses nothing already logged.
+            self._file = open(path, "a", buffering=1, encoding="utf-8")
+
+    def log(self, **record) -> None:
+        if self._file is not None:
+            self._file.write(json.dumps(record) + "\n")
+
+    def close(self) -> None:
+        if self._file is not None:
+            self._file.close()
+            self._file = None
 
 
 def synchronize(device: torch.device) -> None:

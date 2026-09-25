@@ -1,5 +1,6 @@
 import time
 from contextlib import nullcontext
+from dataclasses import asdict
 from pathlib import Path
 
 import torch
@@ -10,6 +11,7 @@ from dataloader import DataLoader
 from model.gpt2 import GPT2, GPT2Config
 from train_utils import (
     DistributedContext,
+    MetricsLogger,
     cleanup_distributed,
     create_optimizer,
     get_lr,
@@ -27,6 +29,8 @@ VOCAB_SIZE = 50_304
 DATA_DIR = Path(__file__).parent / "input" / "fineweb_edu"
 TRAIN_SHARDS = sorted(DATA_DIR.glob("fineweb_edu_train_*.bin"))
 VAL_SHARDS = sorted(DATA_DIR.glob("fineweb_edu_val_*.bin"))
+# Each run writes to its own folder: runs/<start time>/log.jsonl
+RUNS_DIR = Path(__file__).parent / "runs"
 
 # GPT-3 Small trains with ~0.5M tokens per optimizer step (GPT-3 paper, Table 2.1).
 # That does not fit on the GPU at once, so each step accumulates gradients over
@@ -154,7 +158,31 @@ def train(ddp: DistributedContext) -> None:
     eval_batches = min(EVAL_TOKENS // tokens_per_accum_step, len(val_loader))
     assert eval_batches > 0, "EVAL_TOKENS is smaller than one micro-batch on every rank"
 
+    # Only rank 0 writes the log; other ranks get a logger that does nothing.
+    run_dir = RUNS_DIR / time.strftime("%Y%m%d-%H%M%S")
+    logger = MetricsLogger(run_dir / "log.jsonl" if ddp.is_master else None)
+    # First record: everything needed to know what this run was.
+    logger.log(
+        config={
+            "model": asdict(config),
+            "world_size": ddp.world_size,
+            "total_batch_size": TOTAL_BATCH_SIZE,
+            "micro_batch_size": MICRO_BATCH_SIZE,
+            "grad_accum_steps": grad_accum_steps,
+            "max_steps": MAX_STEPS,
+            "warmup_steps": WARMUP_STEPS,
+            "max_lr": MAX_LR,
+            "min_lr": MIN_LR,
+            "weight_decay": WEIGHT_DECAY,
+            "eval_interval": EVAL_INTERVAL,
+            "eval_tokens": eval_batches * tokens_per_accum_step,
+            "seed": SEED,
+            "train_shards": len(TRAIN_SHARDS),
+        }
+    )
+
     if ddp.is_master:
+        print(f"Logging to {logger.path}")
         precision = "bfloat16 mixed precision" if use_bfloat16 else "float32"
         matmul = "tf32" if use_tf32 else "fp32"
         print(f"Using device: {device} x {ddp.world_size} ({precision}, {matmul} matmul)")
@@ -171,6 +199,7 @@ def train(ddp: DistributedContext) -> None:
         val_loss = evaluate(model, val_loader, eval_batches, ddp, use_bfloat16, pin_memory)
         if ddp.is_master:
             print(f"Step {steps_done}/{MAX_STEPS}: val_loss={val_loss:.4f}")
+            logger.log(step=steps_done, val_loss=val_loss)
 
     # Before any training: should be close to ln(VOCAB_SIZE) ~= 10.83.
     run_validation(0)
@@ -229,16 +258,28 @@ def train(ddp: DistributedContext) -> None:
 
         elapsed = time.perf_counter() - start_time
         tokens_per_second = TOTAL_BATCH_SIZE / elapsed if elapsed > 0 else float("inf")
+        steps_done = step + 1
         if ddp.is_master:
+            train_loss = loss_accum.item()
+            grad_norm = norm.item()
             print(
-                f"Step {step + 1}/{MAX_STEPS}: loss={loss_accum.item():.4f}, lr={lr:.2e}, "
-                f"norm={norm.item():.4f}, time={elapsed:.2f}s, "
+                f"Step {steps_done}/{MAX_STEPS}: loss={train_loss:.4f}, lr={lr:.2e}, "
+                f"norm={grad_norm:.4f}, time={elapsed:.2f}s, "
                 f"throughput={tokens_per_second:.2f} tokens/s"
             )
+            logger.log(
+                step=steps_done,
+                train_loss=train_loss,
+                lr=lr,
+                grad_norm=grad_norm,
+                step_time=elapsed,
+                tokens_per_second=tokens_per_second,
+            )
 
-        steps_done = step + 1
         if steps_done % EVAL_INTERVAL == 0 or steps_done == MAX_STEPS:
             run_validation(steps_done)
+
+    logger.close()
 
 
 if __name__ == "__main__":
