@@ -20,8 +20,12 @@ from train_utils import (
 )
 
 SEED = 1337
-VOCAB_SIZE = 1024
-TRAIN_DATA = Path(__file__).parent / "input" / "shakespeare" / "train.bin"
+# GPT-2's tokenizer (tiktoken) has 50,257 tokens. Rounding up to a multiple of 128 gives
+# the embedding and output matmuls GPU-friendly shapes; the extra ids are never used.
+VOCAB_SIZE = 50_304
+# Shards written by input/fineweb_edu/prepare.py
+DATA_DIR = Path(__file__).parent / "input" / "fineweb_edu"
+TRAIN_SHARDS = sorted(DATA_DIR.glob("fineweb_edu_train_*.bin"))
 
 # GPT-3 Small trains with ~0.5M tokens per optimizer step (GPT-3 paper, Table 2.1).
 # That does not fit on the GPU at once, so each step accumulates gradients over
@@ -73,8 +77,12 @@ def train(ddp: DistributedContext) -> None:
     # Pinned memory enables non-blocking CPU-to-CUDA transfers. It is not used
     # for CPU or MPS because those backends do not benefit from CUDA pinning.
     pin_memory = device.type == "cuda"
+    if not TRAIN_SHARDS:
+        raise FileNotFoundError(
+            f"No training shards in {DATA_DIR}. Run: python input/fineweb_edu/prepare.py"
+        )
     data_loader = DataLoader(
-        TRAIN_DATA,
+        TRAIN_SHARDS,
         batch_size=MICRO_BATCH_SIZE,
         block_size=config.block_size,
         shuffle=True,
@@ -101,6 +109,8 @@ def train(ddp: DistributedContext) -> None:
             f"Batch: {TOTAL_BATCH_SIZE:,} tokens/step = {ddp.world_size} GPUs x "
             f"{grad_accum_steps} micro-batches of {MICRO_BATCH_SIZE} x {config.block_size}"
         )
+        pass_tokens = len(data_loader) * tokens_per_micro_batch * ddp.world_size
+        print(f"Data: {len(TRAIN_SHARDS)} shards, {pass_tokens:,} tokens per pass")
 
     model.train()
     for step in range(MAX_STEPS):

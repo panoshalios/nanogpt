@@ -29,7 +29,7 @@ output/      trained tokenizers
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install torch numpy
+pip install torch numpy tiktoken datasets tqdm
 ```
 
 ## Running it
