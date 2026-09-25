@@ -78,9 +78,10 @@ def train(ddp: DistributedContext) -> None:
         batch_size=MICRO_BATCH_SIZE,
         block_size=config.block_size,
         shuffle=True,
-        # A different seed per rank, so each GPU samples different windows of the data.
-        seed=SEED + ddp.rank,
+        seed=SEED,
         pin_memory=pin_memory,
+        rank=ddp.rank,
+        world_size=ddp.world_size,
     )
 
     # Every rank processes grad_accum_steps micro-batches per step, so the global batch
