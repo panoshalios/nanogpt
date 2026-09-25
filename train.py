@@ -26,6 +26,7 @@ VOCAB_SIZE = 50_304
 # Shards written by input/fineweb_edu/prepare.py
 DATA_DIR = Path(__file__).parent / "input" / "fineweb_edu"
 TRAIN_SHARDS = sorted(DATA_DIR.glob("fineweb_edu_train_*.bin"))
+VAL_SHARDS = sorted(DATA_DIR.glob("fineweb_edu_val_*.bin"))
 
 # GPT-3 Small trains with ~0.5M tokens per optimizer step (GPT-3 paper, Table 2.1).
 # That does not fit on the GPU at once, so each step accumulates gradients over
@@ -43,6 +44,12 @@ MIN_LR = MAX_LR * 0.1
 WARMUP_STEPS = 715  # GPT-3 warms up over 375M tokens: 375e6 / 524_288 ~= 715 steps
 WEIGHT_DECAY = 0.1
 
+# Validation: every EVAL_INTERVAL optimizer steps, measure the loss on the first
+# EVAL_TOKENS tokens of the validation shard. The same tokens are used every time, so
+# the numbers are comparable across the run.
+EVAL_INTERVAL = 250
+EVAL_TOKENS = 10_485_760  # 20 * 2**19, split across all ranks
+
 
 def main() -> None:
     # Launch on N GPUs with: torchrun --standalone --nproc_per_node=N train.py
@@ -52,6 +59,38 @@ def main() -> None:
         train(ddp)
     finally:
         cleanup_distributed(ddp)
+
+
+@torch.no_grad()
+def evaluate(
+    model: torch.nn.Module,
+    val_loader: DataLoader,
+    num_batches: int,
+    ddp: DistributedContext,
+    use_bfloat16: bool,
+    pin_memory: bool,
+) -> float:
+    """Mean validation loss over num_batches batches per rank, averaged across ranks."""
+    device = ddp.device
+    # eval() turns off dropout, so the loss is deterministic for fixed weights.
+    model.eval()
+    loss_accum = torch.zeros((), device=device)
+
+    # iter() restarts the loader at the beginning of the (unshuffled) validation data.
+    val_iter = iter(val_loader)
+    for _ in range(num_batches):
+        x, y = next(val_iter)
+        x = x.to(device, non_blocking=pin_memory)
+        y = y.to(device, non_blocking=pin_memory)
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_bfloat16):
+            _, loss = model(x, y)
+        loss_accum += loss.detach() / num_batches
+
+    if ddp.enabled:
+        # Each rank evaluated a different share of the validation tokens.
+        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
+    model.train()
+    return loss_accum.item()
 
 
 def train(ddp: DistributedContext) -> None:
@@ -77,9 +116,10 @@ def train(ddp: DistributedContext) -> None:
     # Pinned memory enables non-blocking CPU-to-CUDA transfers. It is not used
     # for CPU or MPS because those backends do not benefit from CUDA pinning.
     pin_memory = device.type == "cuda"
-    if not TRAIN_SHARDS:
+    if not TRAIN_SHARDS or not VAL_SHARDS:
         raise FileNotFoundError(
-            f"No training shards in {DATA_DIR}. Run: python input/fineweb_edu/prepare.py"
+            f"Missing training or validation shards in {DATA_DIR}. "
+            "Run: python input/fineweb_edu/prepare.py"
         )
     data_loader = DataLoader(
         TRAIN_SHARDS,
@@ -87,6 +127,16 @@ def train(ddp: DistributedContext) -> None:
         block_size=config.block_size,
         shuffle=True,
         seed=SEED,
+        pin_memory=pin_memory,
+        rank=ddp.rank,
+        world_size=ddp.world_size,
+    )
+    # Unshuffled, so every evaluation reads the same tokens; still split by rank.
+    val_loader = DataLoader(
+        VAL_SHARDS,
+        batch_size=MICRO_BATCH_SIZE,
+        block_size=config.block_size,
+        shuffle=False,
         pin_memory=pin_memory,
         rank=ddp.rank,
         world_size=ddp.world_size,
@@ -100,6 +150,9 @@ def train(ddp: DistributedContext) -> None:
         "TOTAL_BATCH_SIZE must be divisible by MICRO_BATCH_SIZE * block_size * world_size"
     )
     grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_accum_step
+    # Capped at one pass so no validation token is counted twice.
+    eval_batches = min(EVAL_TOKENS // tokens_per_accum_step, len(val_loader))
+    assert eval_batches > 0, "EVAL_TOKENS is smaller than one micro-batch on every rank"
 
     if ddp.is_master:
         precision = "bfloat16 mixed precision" if use_bfloat16 else "float32"
@@ -111,6 +164,16 @@ def train(ddp: DistributedContext) -> None:
         )
         pass_tokens = len(data_loader) * tokens_per_micro_batch * ddp.world_size
         print(f"Data: {len(TRAIN_SHARDS)} shards, {pass_tokens:,} tokens per pass")
+        val_tokens = eval_batches * tokens_per_accum_step
+        print(f"Validation: {val_tokens:,} tokens every {EVAL_INTERVAL} steps")
+
+    def run_validation(steps_done: int) -> None:
+        val_loss = evaluate(model, val_loader, eval_batches, ddp, use_bfloat16, pin_memory)
+        if ddp.is_master:
+            print(f"Step {steps_done}/{MAX_STEPS}: val_loss={val_loss:.4f}")
+
+    # Before any training: should be close to ln(VOCAB_SIZE) ~= 10.83.
+    run_validation(0)
 
     model.train()
     for step in range(MAX_STEPS):
@@ -172,6 +235,10 @@ def train(ddp: DistributedContext) -> None:
                 f"norm={norm.item():.4f}, time={elapsed:.2f}s, "
                 f"throughput={tokens_per_second:.2f} tokens/s"
             )
+
+        steps_done = step + 1
+        if steps_done % EVAL_INTERVAL == 0 or steps_done == MAX_STEPS:
+            run_validation(steps_done)
 
 
 if __name__ == "__main__":
