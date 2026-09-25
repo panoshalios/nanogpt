@@ -1,19 +1,25 @@
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from dataloader import DataLoader
 from model.gpt2 import GPT2, GPT2Config
 from train_utils import (
+    DistributedContext,
+    cleanup_distributed,
     create_optimizer,
-    get_device,
     get_lr,
+    setup_distributed,
     supports_bfloat16,
     supports_tf32,
     synchronize,
 )
 
+SEED = 1337
 VOCAB_SIZE = 1024
 TRAIN_DATA = Path(__file__).parent / "input" / "shakespeare" / "train.bin"
 
@@ -35,15 +41,34 @@ WEIGHT_DECAY = 0.1
 
 
 def main() -> None:
-    device = get_device()
+    # Launch on N GPUs with: torchrun --standalone --nproc_per_node=N train.py
+    # Plain `python train.py` runs on a single device as before.
+    ddp = setup_distributed()
+    try:
+        train(ddp)
+    finally:
+        cleanup_distributed(ddp)
+
+
+def train(ddp: DistributedContext) -> None:
+    device = ddp.device
     use_bfloat16 = supports_bfloat16(device)
     use_tf32 = supports_tf32(device)
     # "high" runs float32 matmuls in TF32. Everything else stays in full float32.
     torch.set_float32_matmul_precision("high" if use_tf32 else "highest")
+
+    # Same seed everywhere so every rank starts from identical weights (DDP also
+    # broadcasts rank 0's weights when it wraps the model).
+    torch.manual_seed(SEED)
     config = GPT2Config(vocab_size=VOCAB_SIZE)
     model = GPT2(config).to(device)
     model = torch.compile(model)
-    optimizer = create_optimizer(model, device, lr=MAX_LR, weight_decay=WEIGHT_DECAY)
+    if ddp.enabled:
+        # DDP averages gradients across all ranks during backward().
+        model = DDP(model, device_ids=[ddp.local_rank] if device.type == "cuda" else None)
+    optimizer = create_optimizer(
+        model, device, lr=MAX_LR, weight_decay=WEIGHT_DECAY, verbose=ddp.is_master
+    )
 
     # Pinned memory enables non-blocking CPU-to-CUDA transfers. It is not used
     # for CPU or MPS because those backends do not benefit from CUDA pinning.
@@ -53,22 +78,28 @@ def main() -> None:
         batch_size=MICRO_BATCH_SIZE,
         block_size=config.block_size,
         shuffle=True,
+        # A different seed per rank, so each GPU samples different windows of the data.
+        seed=SEED + ddp.rank,
         pin_memory=pin_memory,
     )
 
+    # Every rank processes grad_accum_steps micro-batches per step, so the global batch
+    # is split across both accumulation and GPUs.
     tokens_per_micro_batch = MICRO_BATCH_SIZE * config.block_size
-    assert TOTAL_BATCH_SIZE % tokens_per_micro_batch == 0, (
-        "TOTAL_BATCH_SIZE must be divisible by MICRO_BATCH_SIZE * block_size"
+    tokens_per_accum_step = tokens_per_micro_batch * ddp.world_size
+    assert TOTAL_BATCH_SIZE % tokens_per_accum_step == 0, (
+        "TOTAL_BATCH_SIZE must be divisible by MICRO_BATCH_SIZE * block_size * world_size"
     )
-    grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_micro_batch
+    grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_accum_step
 
-    precision = "bfloat16 mixed precision" if use_bfloat16 else "float32"
-    matmul = "tf32" if use_tf32 else "fp32"
-    print(f"Using device: {device} ({precision}, {matmul} matmul)")
-    print(
-        f"Batch: {TOTAL_BATCH_SIZE:,} tokens/step = {grad_accum_steps} micro-batches "
-        f"of {MICRO_BATCH_SIZE} x {config.block_size}"
-    )
+    if ddp.is_master:
+        precision = "bfloat16 mixed precision" if use_bfloat16 else "float32"
+        matmul = "tf32" if use_tf32 else "fp32"
+        print(f"Using device: {device} x {ddp.world_size} ({precision}, {matmul} matmul)")
+        print(
+            f"Batch: {TOTAL_BATCH_SIZE:,} tokens/step = {ddp.world_size} GPUs x "
+            f"{grad_accum_steps} micro-batches of {MICRO_BATCH_SIZE} x {config.block_size}"
+        )
 
     model.train()
     for step in range(MAX_STEPS):
@@ -78,26 +109,40 @@ def main() -> None:
         optimizer.zero_grad(set_to_none=True)
         loss_accum = torch.zeros((), device=device)
 
-        for _ in range(grad_accum_steps):
+        for micro_step in range(grad_accum_steps):
             x, y = data_loader.next_batch()
             x = x.to(device, non_blocking=pin_memory)
             y = y.to(device, non_blocking=pin_memory)
 
-            with torch.autocast(
-                device_type=device.type,
-                dtype=torch.bfloat16,
-                enabled=use_bfloat16,
-            ):
-                _, loss = model(x, y)
+            # DDP would all-reduce gradients on every backward(). Only the last
+            # micro-batch needs it; before that, gradients just add up locally.
+            is_last_micro_step = micro_step == grad_accum_steps - 1
+            sync_context = (
+                model.no_sync() if ddp.enabled and not is_last_micro_step else nullcontext()
+            )
 
-            # The loss is a mean over one micro-batch. backward() adds gradients
-            # together, so divide by grad_accum_steps to get the mean over the
-            # full batch, which is what one big batch would have produced.
-            loss = loss / grad_accum_steps
-            loss_accum += loss.detach()
-            loss.backward()
+            with sync_context:
+                with torch.autocast(
+                    device_type=device.type,
+                    dtype=torch.bfloat16,
+                    enabled=use_bfloat16,
+                ):
+                    _, loss = model(x, y)
 
-        # Clip gradient norm (of the full-batch gradient)
+                # The loss is a mean over one micro-batch. backward() adds gradients
+                # together, so divide by grad_accum_steps to get the mean over the
+                # full batch, which is what one big batch would have produced.
+                loss = loss / grad_accum_steps
+                loss_accum += loss.detach()
+                loss.backward()
+
+        if ddp.enabled:
+            # loss_accum only covers this rank's micro-batches. Average it across
+            # ranks so the logged loss is for the full global batch.
+            dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
+
+        # Clip gradient norm (of the full-batch gradient). Gradients are already
+        # identical on every rank after the all-reduce, so each rank clips the same way.
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
         # Set this step's learning rate before the optimizer uses it.
@@ -110,11 +155,12 @@ def main() -> None:
 
         elapsed = time.perf_counter() - start_time
         tokens_per_second = TOTAL_BATCH_SIZE / elapsed if elapsed > 0 else float("inf")
-        print(
-            f"Step {step + 1}/{MAX_STEPS}: loss={loss_accum.item():.4f}, lr={lr:.2e}, "
-            f"norm={norm.item():.4f}, time={elapsed:.2f}s, "
-            f"throughput={tokens_per_second:.2f} tokens/s"
-        )
+        if ddp.is_master:
+            print(
+                f"Step {step + 1}/{MAX_STEPS}: loss={loss_accum.item():.4f}, lr={lr:.2e}, "
+                f"norm={norm.item():.4f}, time={elapsed:.2f}s, "
+                f"throughput={tokens_per_second:.2f} tokens/s"
+            )
 
 
 if __name__ == "__main__":

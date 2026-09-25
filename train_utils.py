@@ -1,8 +1,11 @@
-"""Device, learning rate schedule and optimizer helpers used by train.py."""
+"""Device, distributed, learning rate schedule and optimizer helpers used by train.py."""
 
 import math
+import os
+from dataclasses import dataclass
 
 import torch
+import torch.distributed as dist
 
 
 def get_device() -> torch.device:
@@ -11,6 +14,53 @@ def get_device() -> torch.device:
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+@dataclass
+class DistributedContext:
+    enabled: bool  # True when launched with torchrun
+    rank: int  # global process index, 0 .. world_size - 1
+    local_rank: int  # GPU index on this machine
+    world_size: int  # total number of processes (GPUs)
+    device: torch.device
+
+    @property
+    def is_master(self) -> bool:
+        # Rank 0 does logging (and later checkpointing) so it only happens once.
+        return self.rank == 0
+
+
+def setup_distributed() -> DistributedContext:
+    # torchrun sets RANK, LOCAL_RANK and WORLD_SIZE for every process it launches.
+    # Without them this is a normal single-process run.
+    if "RANK" not in os.environ:
+        return DistributedContext(
+            enabled=False, rank=0, local_rank=0, world_size=1, device=get_device()
+        )
+
+    rank = int(os.environ["RANK"])
+    local_rank = int(os.environ["LOCAL_RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+
+    if torch.cuda.is_available():
+        # Each process drives exactly one GPU and talks to the others over NCCL.
+        device = torch.device(f"cuda:{local_rank}")
+        torch.cuda.set_device(device)
+        backend = "nccl"
+    else:
+        # CPU fallback (gloo) so the distributed code path can be tested without GPUs.
+        device = torch.device("cpu")
+        backend = "gloo"
+
+    dist.init_process_group(backend=backend)
+    return DistributedContext(
+        enabled=True, rank=rank, local_rank=local_rank, world_size=world_size, device=device
+    )
+
+
+def cleanup_distributed(ctx: DistributedContext) -> None:
+    if ctx.enabled:
+        dist.destroy_process_group()
 
 
 def synchronize(device: torch.device) -> None:
@@ -50,7 +100,11 @@ def get_lr(step: int, max_steps: int, warmup_steps: int, max_lr: float, min_lr: 
 
 
 def create_optimizer(
-    model: torch.nn.Module, device: torch.device, lr: float, weight_decay: float
+    model: torch.nn.Module,
+    device: torch.device,
+    lr: float,
+    weight_decay: float,
+    verbose: bool = True,
 ) -> torch.optim.AdamW:
     # GPT-3 style weight decay: only 2D parameters (Linear weights and embeddings) are
     # decayed. 1D parameters (biases and LayerNorm weights) are not. Decaying them only
@@ -65,8 +119,9 @@ def create_optimizer(
     ]
     num_decay = sum(p.numel() for p in decay_params)
     num_no_decay = sum(p.numel() for p in no_decay_params)
-    print(f"Decayed params: {len(decay_params)} tensors, {num_decay:,} values")
-    print(f"Non-decayed params: {len(no_decay_params)} tensors, {num_no_decay:,} values")
+    if verbose:
+        print(f"Decayed params: {len(decay_params)} tensors, {num_decay:,} values")
+        print(f"Non-decayed params: {len(no_decay_params)} tensors, {num_no_decay:,} values")
 
     return torch.optim.AdamW(
         param_groups,
