@@ -80,6 +80,7 @@ class DataLoader:
         self._offsets = np.arange(block_size + 1)
         self._pass_index = 0  # how many passes over the data have started
         self._shard_queue: list[int] = []  # shards still to read in the current pass
+        self._current_shard: int | None = None  # shard being read
         self._tokens: np.ndarray | None = None  # memmap of the current shard
         self._chunk_starts: np.ndarray | None = None  # this rank's starts in the shard
         self._batch_index = 0  # next batch within the current shard
@@ -109,7 +110,9 @@ class DataLoader:
         self._load_next_shard()
 
     def _load_next_shard(self) -> None:
-        shard = self._shard_queue.pop(0)
+        self._open_shard(self._shard_queue.pop(0))
+
+    def _open_shard(self, shard: int) -> None:
         length = self._shard_lengths[shard]
         num_chunks = (length - 1 - self._max_offset) // self.block_size
 
@@ -127,6 +130,7 @@ class DataLoader:
         my_chunks = order[self.rank :: self.world_size][:num_used]
         self._chunk_starts = offset + my_chunks * self.block_size
         self._tokens = np.memmap(self.file_paths[shard], dtype=np.uint16, mode="r")
+        self._current_shard = shard
         self._batch_index = 0
 
     def _pass_finished(self) -> bool:
@@ -164,3 +168,39 @@ class DataLoader:
         if self._chunk_starts is None or self._pass_finished():
             self._start_pass()
         return next(self)
+
+    def state_dict(self) -> dict:
+        """Position in the data, for checkpointing.
+
+        The shard and chunk orders are recomputed from (seed, pass, shard), so the position
+        is just a few integers. Every rank reads the same number of batches from the same
+        shard, so rank 0's state is valid on every rank.
+        """
+        return {
+            "pass_index": self._pass_index,
+            "shard_queue": list(self._shard_queue),
+            "current_shard": self._current_shard,
+            "batch_index": self._batch_index,
+            # Stored to catch resuming with a different data layout.
+            "num_batches": self.num_batches,
+            "world_size": self.world_size,
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        """Continue reading from a position saved by state_dict()."""
+        if state["world_size"] != self.world_size or state["num_batches"] != self.num_batches:
+            raise ValueError(
+                "data loader state was saved with a different world size, batch size, "
+                "block size or set of shards; it cannot be resumed with this setup"
+            )
+        self._pass_index = state["pass_index"]
+        self._shard_queue = list(state["shard_queue"])
+        if state["current_shard"] is None:
+            # Saved before the first batch was read.
+            self._current_shard = None
+            self._chunk_starts = None
+            self._batch_index = 0
+        else:
+            # _open_shard uses the restored pass index, so it rebuilds the same order.
+            self._open_shard(state["current_shard"])
+            self._batch_index = state["batch_index"]

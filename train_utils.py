@@ -1,4 +1,4 @@
-"""Device, distributed, logging, learning rate schedule and optimizer helpers for train.py."""
+"""Device, distributed, logging, checkpoint, LR schedule and optimizer helpers for train.py."""
 
 import json
 import math
@@ -90,6 +90,28 @@ class MetricsLogger:
         if self._file is not None:
             self._file.close()
             self._file = None
+
+
+def checkpoint_path(run_dir: Path, step: int) -> Path:
+    return run_dir / f"checkpoint_{step:06d}.pt"
+
+
+def save_checkpoint(path: Path, checkpoint: dict) -> None:
+    # Save to a temporary file and rename it, so a crash mid-save never leaves a
+    # truncated checkpoint that looks complete.
+    tmp_path = path.with_suffix(".tmp")
+    torch.save(checkpoint, tmp_path)
+    os.replace(tmp_path, path)
+
+
+def find_checkpoint(path: Path) -> Path:
+    """Resolve --resume: a checkpoint file, or a run folder (use its latest checkpoint)."""
+    if path.is_file():
+        return path
+    checkpoints = sorted(path.glob("checkpoint_*.pt"))
+    if not checkpoints:
+        raise FileNotFoundError(f"No checkpoints found in {path}")
+    return checkpoints[-1]  # zero-padded step numbers sort in step order
 
 
 def synchronize(device: torch.device) -> None:

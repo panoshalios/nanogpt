@@ -1,3 +1,4 @@
+import argparse
 import time
 from contextlib import nullcontext
 from dataclasses import asdict
@@ -12,9 +13,12 @@ from model.gpt2 import GPT2, GPT2Config
 from train_utils import (
     DistributedContext,
     MetricsLogger,
+    checkpoint_path,
     cleanup_distributed,
     create_optimizer,
+    find_checkpoint,
     get_lr,
+    save_checkpoint,
     setup_distributed,
     supports_bfloat16,
     supports_tf32,
@@ -29,7 +33,7 @@ VOCAB_SIZE = 50_304
 DATA_DIR = Path(__file__).parent / "input" / "fineweb_edu"
 TRAIN_SHARDS = sorted(DATA_DIR.glob("fineweb_edu_train_*.bin"))
 VAL_SHARDS = sorted(DATA_DIR.glob("fineweb_edu_val_*.bin"))
-# Each run writes to its own folder: runs/<start time>/log.jsonl
+# Each run writes to its own folder: runs/<start time>/ holds log.jsonl and checkpoints
 RUNS_DIR = Path(__file__).parent / "runs"
 
 # GPT-3 Small trains with ~0.5M tokens per optimizer step (GPT-3 paper, Table 2.1).
@@ -54,13 +58,28 @@ WEIGHT_DECAY = 0.1
 EVAL_INTERVAL = 250
 EVAL_TOKENS = 10_485_760  # 20 * 2**19, split across all ranks
 
+# Save model, optimizer and data position every CHECKPOINT_INTERVAL steps and at the end.
+# A multiple of EVAL_INTERVAL, so every checkpoint has a validation loss. Each checkpoint
+# is ~1.5 GB for the 124M model (fp32 weights plus AdamW's two moment buffers).
+CHECKPOINT_INTERVAL = 1000
+
 
 def main() -> None:
     # Launch on N GPUs with: torchrun --standalone --nproc_per_node=N train.py
     # Plain `python train.py` runs on a single device as before.
+    # Resume with: ... train.py --resume runs/<run>  (or a specific checkpoint file)
+    parser = argparse.ArgumentParser(description="Train GPT-2 on FineWeb-Edu shards.")
+    parser.add_argument(
+        "--resume",
+        type=Path,
+        default=None,
+        help="checkpoint file, or run folder to resume from its latest checkpoint",
+    )
+    args = parser.parse_args()
+
     ddp = setup_distributed()
     try:
-        train(ddp)
+        train(ddp, args.resume)
     finally:
         cleanup_distributed(ddp)
 
@@ -97,7 +116,7 @@ def evaluate(
     return loss_accum.item()
 
 
-def train(ddp: DistributedContext) -> None:
+def train(ddp: DistributedContext, resume: Path | None = None) -> None:
     device = ddp.device
     use_bfloat16 = supports_bfloat16(device)
     use_tf32 = supports_tf32(device)
@@ -108,14 +127,30 @@ def train(ddp: DistributedContext) -> None:
     # broadcasts rank 0's weights when it wraps the model).
     torch.manual_seed(SEED)
     config = GPT2Config(vocab_size=VOCAB_SIZE)
-    model = GPT2(config).to(device)
-    model = torch.compile(model)
+    # raw_model is the plain module. Its state_dict has clean parameter names, unlike
+    # the torch.compile and DDP wrappers, so checkpoints load into any setup.
+    raw_model = GPT2(config).to(device)
+
+    checkpoint = None
+    if resume is not None:
+        checkpoint_file = find_checkpoint(resume)
+        # Every rank loads the file onto its own device.
+        checkpoint = torch.load(checkpoint_file, map_location=device)
+        if checkpoint["model_config"] != asdict(config):
+            raise ValueError(f"{checkpoint_file} was saved with a different model config")
+        raw_model.load_state_dict(checkpoint["model"])
+
+    model = torch.compile(raw_model)
     if ddp.enabled:
         # DDP averages gradients across all ranks during backward().
         model = DDP(model, device_ids=[ddp.local_rank] if device.type == "cuda" else None)
     optimizer = create_optimizer(
-        model, device, lr=MAX_LR, weight_decay=WEIGHT_DECAY, verbose=ddp.is_master
+        raw_model, device, lr=MAX_LR, weight_decay=WEIGHT_DECAY, verbose=ddp.is_master
     )
+    if checkpoint is not None:
+        # Restores AdamW's moment estimates, not just the weights. Without them the
+        # optimizer would restart from zero and the loss would jump after resuming.
+        optimizer.load_state_dict(checkpoint["optimizer"])
 
     # Pinned memory enables non-blocking CPU-to-CUDA transfers. It is not used
     # for CPU or MPS because those backends do not benefit from CUDA pinning.
@@ -135,6 +170,9 @@ def train(ddp: DistributedContext) -> None:
         rank=ddp.rank,
         world_size=ddp.world_size,
     )
+    if checkpoint is not None:
+        # Continue with the next unread batch instead of restarting the data.
+        data_loader.load_state_dict(checkpoint["data_loader"])
     # Unshuffled, so every evaluation reads the same tokens; still split by rank.
     val_loader = DataLoader(
         VAL_SHARDS,
@@ -158,31 +196,44 @@ def train(ddp: DistributedContext) -> None:
     eval_batches = min(EVAL_TOKENS // tokens_per_accum_step, len(val_loader))
     assert eval_batches > 0, "EVAL_TOKENS is smaller than one micro-batch on every rank"
 
+    # A resumed run keeps writing to its original folder and log.
+    start_step = checkpoint["step"] if checkpoint is not None else 0
+    if checkpoint is not None:
+        run_dir = checkpoint_file.parent
+    else:
+        run_dir = RUNS_DIR / time.strftime("%Y%m%d-%H%M%S")
     # Only rank 0 writes the log; other ranks get a logger that does nothing.
-    run_dir = RUNS_DIR / time.strftime("%Y%m%d-%H%M%S")
     logger = MetricsLogger(run_dir / "log.jsonl" if ddp.is_master else None)
-    # First record: everything needed to know what this run was.
-    logger.log(
-        config={
-            "model": asdict(config),
-            "world_size": ddp.world_size,
-            "total_batch_size": TOTAL_BATCH_SIZE,
-            "micro_batch_size": MICRO_BATCH_SIZE,
-            "grad_accum_steps": grad_accum_steps,
-            "max_steps": MAX_STEPS,
-            "warmup_steps": WARMUP_STEPS,
-            "max_lr": MAX_LR,
-            "min_lr": MIN_LR,
-            "weight_decay": WEIGHT_DECAY,
-            "eval_interval": EVAL_INTERVAL,
-            "eval_tokens": eval_batches * tokens_per_accum_step,
-            "seed": SEED,
-            "train_shards": len(TRAIN_SHARDS),
-        }
-    )
+    if checkpoint is not None:
+        # Steps after this checkpoint that were logged before the interruption will be
+        # logged again; when reading the log, keep the last record for each step.
+        logger.log(resumed_from=str(checkpoint_file), step=start_step)
+    else:
+        # First record: everything needed to know what this run was.
+        logger.log(
+            config={
+                "model": asdict(config),
+                "world_size": ddp.world_size,
+                "total_batch_size": TOTAL_BATCH_SIZE,
+                "micro_batch_size": MICRO_BATCH_SIZE,
+                "grad_accum_steps": grad_accum_steps,
+                "max_steps": MAX_STEPS,
+                "warmup_steps": WARMUP_STEPS,
+                "max_lr": MAX_LR,
+                "min_lr": MIN_LR,
+                "weight_decay": WEIGHT_DECAY,
+                "eval_interval": EVAL_INTERVAL,
+                "eval_tokens": eval_batches * tokens_per_accum_step,
+                "checkpoint_interval": CHECKPOINT_INTERVAL,
+                "seed": SEED,
+                "train_shards": len(TRAIN_SHARDS),
+            }
+        )
 
     if ddp.is_master:
         print(f"Logging to {logger.path}")
+        if checkpoint is not None:
+            print(f"Resumed from {checkpoint_file} at step {start_step}")
         precision = "bfloat16 mixed precision" if use_bfloat16 else "float32"
         matmul = "tf32" if use_tf32 else "fp32"
         print(f"Using device: {device} x {ddp.world_size} ({precision}, {matmul} matmul)")
@@ -195,17 +246,19 @@ def train(ddp: DistributedContext) -> None:
         val_tokens = eval_batches * tokens_per_accum_step
         print(f"Validation: {val_tokens:,} tokens every {EVAL_INTERVAL} steps")
 
-    def run_validation(steps_done: int) -> None:
+    def run_validation(steps_done: int) -> float:
         val_loss = evaluate(model, val_loader, eval_batches, ddp, use_bfloat16, pin_memory)
         if ddp.is_master:
             print(f"Step {steps_done}/{MAX_STEPS}: val_loss={val_loss:.4f}")
             logger.log(step=steps_done, val_loss=val_loss)
+        return val_loss
 
-    # Before any training: should be close to ln(VOCAB_SIZE) ~= 10.83.
-    run_validation(0)
+    if checkpoint is None:
+        # Before any training: should be close to ln(VOCAB_SIZE) ~= 10.83.
+        run_validation(0)
 
     model.train()
-    for step in range(MAX_STEPS):
+    for step in range(start_step, MAX_STEPS):
         synchronize(device)
         start_time = time.perf_counter()
 
@@ -276,8 +329,30 @@ def train(ddp: DistributedContext) -> None:
                 tokens_per_second=tokens_per_second,
             )
 
-        if steps_done % EVAL_INTERVAL == 0 or steps_done == MAX_STEPS:
-            run_validation(steps_done)
+        is_last_step = steps_done == MAX_STEPS
+        val_loss = None
+        if steps_done % EVAL_INTERVAL == 0 or is_last_step:
+            val_loss = run_validation(steps_done)
+
+        if (steps_done % CHECKPOINT_INTERVAL == 0 or is_last_step) and ddp.is_master:
+            # Weights and optimizer state are identical on every rank, so rank 0 saves
+            # them once. The other ranks carry on and wait for it at the next all-reduce.
+            save_start = time.perf_counter()
+            path = checkpoint_path(run_dir, steps_done)
+            save_checkpoint(
+                path,
+                {
+                    "model": raw_model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "data_loader": data_loader.state_dict(),
+                    "step": steps_done,
+                    "model_config": asdict(config),
+                    "val_loss": val_loss,
+                },
+            )
+            save_time = time.perf_counter() - save_start
+            print(f"Saved checkpoint {path} ({save_time:.1f}s)")
+            logger.log(step=steps_done, checkpoint=str(path))
 
     logger.close()
 
