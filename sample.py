@@ -1,12 +1,17 @@
-# Generates text from a training checkpoint.
+# Generates text from trained weights: the published model on the Hugging Face Hub, a
+# local export folder, or a training checkpoint.
 #
-#   python sample.py runs/<run>                  latest checkpoint in the run folder
+#   python sample.py panoshalios/nanogpt-124m-fineweb-edu   weights from the Hub
+#   python sample.py runs/<run>/export                      folder written by export.py
+#   python sample.py runs/<run>                             latest checkpoint of a run
 #   python sample.py runs/<run>/checkpoint_019073.pt --prompt "The meaning of life is"
 import argparse
+import json
 from pathlib import Path
 
 import tiktoken
 import torch
+from safetensors.torch import load_model as load_safetensors
 
 from model.gpt2 import GPT2, GPT2Config
 from train_utils import find_checkpoint, get_device, supports_bfloat16
@@ -21,6 +26,40 @@ def load_model(checkpoint_file: Path, device: torch.device) -> tuple[GPT2, dict]
     model.load_state_dict(checkpoint["model"])
     model.eval()  # turns off dropout
     return model, checkpoint
+
+
+def load_weights(source: str, device: torch.device) -> tuple[GPT2, str]:
+    """Load a model from a Hub repo id, an export folder, a checkpoint, or a run folder.
+
+    Returns the model and a short description of what was loaded.
+    """
+    path = Path(source)
+    if path.exists() and not (path / "model.safetensors").is_file():
+        # A training checkpoint, or a run folder (use its latest checkpoint).
+        checkpoint_file = find_checkpoint(path)
+        model, checkpoint = load_model(checkpoint_file, device)
+        val_loss = checkpoint.get("val_loss")
+        val_text = f", val_loss={val_loss:.4f}" if val_loss is not None else ""
+        return model, f"{checkpoint_file} (step {checkpoint['step']}{val_text})"
+
+    if path.exists():
+        # A folder written by export.py: model.safetensors + config.json.
+        config_file, weights_file = path / "config.json", path / "model.safetensors"
+    else:
+        # Otherwise a Hugging Face repo id like "user/name". Files are downloaded once
+        # and cached in ~/.cache/huggingface.
+        from huggingface_hub import hf_hub_download
+
+        config_file = hf_hub_download(source, "config.json")
+        weights_file = hf_hub_download(source, "model.safetensors")
+
+    config = json.loads(Path(config_file).read_text())
+    model = GPT2(GPT2Config(**config))
+    # load_model (not load_file) re-ties the output layer to the token embedding, which
+    # export.py stored only once.
+    load_safetensors(model, str(weights_file))
+    model.to(device).eval()  # eval() turns off dropout
+    return model, source
 
 
 def generate_text(
@@ -63,8 +102,11 @@ def generate_text(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Sample text from a GPT-2 checkpoint.")
-    parser.add_argument("checkpoint", type=Path, help="checkpoint file, or run folder (latest)")
+    parser = argparse.ArgumentParser(description="Sample text from trained GPT-2 weights.")
+    parser.add_argument(
+        "source",
+        help="Hugging Face repo id, export folder, checkpoint file, or run folder (latest)",
+    )
     parser.add_argument("--prompt", default="Hello, I'm a language model,")
     parser.add_argument("--num-samples", type=int, default=4)
     parser.add_argument("--max-new-tokens", type=int, default=100)
@@ -76,11 +118,8 @@ def main() -> None:
     args = parser.parse_args()
 
     device = get_device()
-    checkpoint_file = find_checkpoint(args.checkpoint)
-    model, checkpoint = load_model(checkpoint_file, device)
-    val_loss = checkpoint.get("val_loss")
-    val_text = f", val_loss={val_loss:.4f}" if val_loss is not None else ""
-    print(f"Loaded {checkpoint_file} (step {checkpoint['step']}{val_text}) on {device}")
+    model, description = load_weights(args.source, device)
+    print(f"Loaded {description} on {device}")
 
     texts = generate_text(
         model,
