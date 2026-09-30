@@ -41,7 +41,7 @@ RUNS_DIR = Path(__file__).parent / "runs"
 # That does not fit on the GPU at once, so each step accumulates gradients over
 # several micro-batches of MICRO_BATCH_SIZE sequences of block_size tokens.
 TOTAL_BATCH_SIZE = 524_288  # 2**19 tokens per optimizer step
-MICRO_BATCH_SIZE = 16  # sequences per forward/backward pass
+MICRO_BATCH_SIZE = 64  # sequences per forward/backward pass
 
 # Training length in optimizer steps. 19_073 steps * 524_288 tokens ~= 10B tokens.
 MAX_STEPS = 19_073
