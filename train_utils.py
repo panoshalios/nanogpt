@@ -65,16 +65,38 @@ def cleanup_distributed(ctx: DistributedContext) -> None:
         dist.destroy_process_group()
 
 
+def init_wandb(project: str, run_dir: Path, config: dict, run_id: str | None = None):
+    """Start (or, with run_id, continue) a Weights & Biases run. Call on rank 0 only."""
+    import wandb  # imported here so training works without wandb installed
+
+    run = wandb.init(
+        project=project,
+        name=run_dir.name,
+        config=config,
+        dir=run_dir,  # W&B's local files live next to the log and checkpoints
+        id=run_id,
+        resume="allow",  # with run_id: keep adding to the same charts after --resume
+    )
+    # Plot every metric against our optimizer step instead of W&B's internal counter.
+    # After a resume, steps since the last checkpoint are logged again; with a custom
+    # x-axis those show up as overlapping points instead of being rejected.
+    run.define_metric("step")
+    run.define_metric("*", step_metric="step")
+    return run
+
+
 class MetricsLogger:
     """Appends one JSON object per line (JSON Lines) to a log file.
 
     Load it with pandas.read_json(path, lines=True), or follow it live with tail -f.
     Pass path=None on non-master ranks to make every call a no-op, so each record is
-    written once.
+    written once. With a wandb_run, numeric metrics of records that have a step are also
+    sent to Weights & Biases.
     """
 
-    def __init__(self, path: Path | None):
+    def __init__(self, path: Path | None, wandb_run=None):
         self.path = path
+        self.wandb_run = wandb_run
         self._file = None
         if path is not None:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -85,11 +107,19 @@ class MetricsLogger:
     def log(self, **record) -> None:
         if self._file is not None:
             self._file.write(json.dumps(record) + "\n")
+        if self.wandb_run is not None and "step" in record:
+            # Only numbers are charted; e.g. checkpoint paths stay in the JSONL log.
+            metrics = {k: v for k, v in record.items() if isinstance(v, (int, float))}
+            if len(metrics) > 1:  # more than just the step
+                self.wandb_run.log(metrics)
 
     def close(self) -> None:
         if self._file is not None:
             self._file.close()
             self._file = None
+        if self.wandb_run is not None:
+            self.wandb_run.finish()
+            self.wandb_run = None
 
 
 def checkpoint_path(run_dir: Path, step: int) -> Path:

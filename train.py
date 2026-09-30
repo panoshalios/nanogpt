@@ -18,6 +18,7 @@ from train_utils import (
     create_optimizer,
     find_checkpoint,
     get_lr,
+    init_wandb,
     save_checkpoint,
     setup_distributed,
     supports_bfloat16,
@@ -75,11 +76,15 @@ def main() -> None:
         default=None,
         help="checkpoint file, or run folder to resume from its latest checkpoint",
     )
+    # Optional live dashboard. Run `wandb login` once first; without --wandb, W&B is
+    # never imported and only the local JSONL log is written.
+    parser.add_argument("--wandb", action="store_true", help="also log to Weights & Biases")
+    parser.add_argument("--wandb-project", default="nanogpt")
     args = parser.parse_args()
 
     ddp = setup_distributed()
     try:
-        train(ddp, args.resume)
+        train(ddp, args.resume, args.wandb_project if args.wandb else None)
     finally:
         cleanup_distributed(ddp)
 
@@ -116,7 +121,9 @@ def evaluate(
     return loss_accum.item()
 
 
-def train(ddp: DistributedContext, resume: Path | None = None) -> None:
+def train(
+    ddp: DistributedContext, resume: Path | None = None, wandb_project: str | None = None
+) -> None:
     device = ddp.device
     use_bfloat16 = supports_bfloat16(device)
     use_tf32 = supports_tf32(device)
@@ -202,36 +209,44 @@ def train(ddp: DistributedContext, resume: Path | None = None) -> None:
         run_dir = checkpoint_file.parent
     else:
         run_dir = RUNS_DIR / time.strftime("%Y%m%d-%H%M%S")
+    # Everything needed to know what this run was.
+    run_config = {
+        "model": asdict(config),
+        "world_size": ddp.world_size,
+        "total_batch_size": TOTAL_BATCH_SIZE,
+        "micro_batch_size": MICRO_BATCH_SIZE,
+        "grad_accum_steps": grad_accum_steps,
+        "max_steps": MAX_STEPS,
+        "warmup_steps": WARMUP_STEPS,
+        "max_lr": MAX_LR,
+        "min_lr": MIN_LR,
+        "weight_decay": WEIGHT_DECAY,
+        "eval_interval": EVAL_INTERVAL,
+        "eval_tokens": eval_batches * tokens_per_accum_step,
+        "checkpoint_interval": CHECKPOINT_INTERVAL,
+        "seed": SEED,
+        "train_shards": len(TRAIN_SHARDS),
+    }
+
+    wandb_run = None
+    if wandb_project is not None and ddp.is_master:
+        # A resumed run continues the W&B run whose id was saved in the checkpoint.
+        wandb_run_id = checkpoint.get("wandb_run_id") if checkpoint is not None else None
+        wandb_run = init_wandb(wandb_project, run_dir, run_config, wandb_run_id)
+
     # Only rank 0 writes the log; other ranks get a logger that does nothing.
-    logger = MetricsLogger(run_dir / "log.jsonl" if ddp.is_master else None)
+    logger = MetricsLogger(run_dir / "log.jsonl" if ddp.is_master else None, wandb_run)
     if checkpoint is not None:
         # Steps after this checkpoint that were logged before the interruption will be
         # logged again; when reading the log, keep the last record for each step.
         logger.log(resumed_from=str(checkpoint_file), step=start_step)
     else:
-        # First record: everything needed to know what this run was.
-        logger.log(
-            config={
-                "model": asdict(config),
-                "world_size": ddp.world_size,
-                "total_batch_size": TOTAL_BATCH_SIZE,
-                "micro_batch_size": MICRO_BATCH_SIZE,
-                "grad_accum_steps": grad_accum_steps,
-                "max_steps": MAX_STEPS,
-                "warmup_steps": WARMUP_STEPS,
-                "max_lr": MAX_LR,
-                "min_lr": MIN_LR,
-                "weight_decay": WEIGHT_DECAY,
-                "eval_interval": EVAL_INTERVAL,
-                "eval_tokens": eval_batches * tokens_per_accum_step,
-                "checkpoint_interval": CHECKPOINT_INTERVAL,
-                "seed": SEED,
-                "train_shards": len(TRAIN_SHARDS),
-            }
-        )
+        logger.log(config=run_config)
 
     if ddp.is_master:
         print(f"Logging to {logger.path}")
+        if wandb_run is not None:
+            print(f"W&B run: {wandb_run.url}")
         if checkpoint is not None:
             print(f"Resumed from {checkpoint_file} at step {start_step}")
         precision = "bfloat16 mixed precision" if use_bfloat16 else "float32"
@@ -348,6 +363,7 @@ def train(ddp: DistributedContext, resume: Path | None = None) -> None:
                     "step": steps_done,
                     "model_config": asdict(config),
                     "val_loss": val_loss,
+                    "wandb_run_id": wandb_run.id if wandb_run is not None else None,
                 },
             )
             save_time = time.perf_counter() - save_start

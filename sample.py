@@ -12,6 +12,56 @@ from model.gpt2 import GPT2, GPT2Config
 from train_utils import find_checkpoint, get_device, supports_bfloat16
 
 
+def load_model(checkpoint_file: Path, device: torch.device) -> tuple[GPT2, dict]:
+    """Rebuild the model from a checkpoint; returns the model and the checkpoint dict."""
+    checkpoint = torch.load(checkpoint_file, map_location=device)
+    # The checkpoint stores the config it was trained with, so the model is rebuilt at
+    # exactly the right shapes before loading the weights.
+    model = GPT2(GPT2Config(**checkpoint["model_config"])).to(device)
+    model.load_state_dict(checkpoint["model"])
+    model.eval()  # turns off dropout
+    return model, checkpoint
+
+
+def generate_text(
+    model: GPT2,
+    prompt: str,
+    num_samples: int,
+    max_new_tokens: int,
+    temperature: float = 1.0,
+    top_k: int | None = 50,
+    seed: int = 42,
+) -> list[str]:
+    """Continue prompt num_samples times; each result includes the prompt."""
+    device = next(model.parameters()).device
+    enc = tiktoken.get_encoding("gpt2")
+    prompt_tokens = enc.encode(prompt)
+    # One row per sample; every row starts with the same prompt.
+    idx = torch.tensor(prompt_tokens, dtype=torch.long, device=device)
+    idx = idx.unsqueeze(0).repeat(num_samples, 1)
+
+    torch.manual_seed(seed)
+    with torch.autocast(
+        device_type=device.type, dtype=torch.bfloat16, enabled=supports_bfloat16(device)
+    ):
+        out = model.generate(
+            idx,
+            max_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            num_valid_tokens=enc.n_vocab,  # never sample the padding ids
+        )
+
+    texts = []
+    for row in out.tolist():
+        new_tokens = row[len(prompt_tokens) :]
+        # <|endoftext|> starts an unrelated document in the training data, so stop there.
+        if enc.eot_token in new_tokens:
+            new_tokens = new_tokens[: new_tokens.index(enc.eot_token)]
+        texts.append(prompt + enc.decode(new_tokens))
+    return texts
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Sample text from a GPT-2 checkpoint.")
     parser.add_argument("checkpoint", type=Path, help="checkpoint file, or run folder (latest)")
@@ -27,42 +77,23 @@ def main() -> None:
 
     device = get_device()
     checkpoint_file = find_checkpoint(args.checkpoint)
-    checkpoint = torch.load(checkpoint_file, map_location=device)
-
-    # The checkpoint stores the config it was trained with, so the model is rebuilt at
-    # exactly the right shapes before loading the weights.
-    model = GPT2(GPT2Config(**checkpoint["model_config"])).to(device)
-    model.load_state_dict(checkpoint["model"])
-    model.eval()  # turns off dropout
+    model, checkpoint = load_model(checkpoint_file, device)
     val_loss = checkpoint.get("val_loss")
     val_text = f", val_loss={val_loss:.4f}" if val_loss is not None else ""
     print(f"Loaded {checkpoint_file} (step {checkpoint['step']}{val_text}) on {device}")
 
-    enc = tiktoken.get_encoding("gpt2")
-    prompt_tokens = enc.encode(args.prompt)
-    # One row per sample; every row starts with the same prompt.
-    idx = torch.tensor(prompt_tokens, dtype=torch.long, device=device)
-    idx = idx.unsqueeze(0).repeat(args.num_samples, 1)
-
-    torch.manual_seed(args.seed)
-    with torch.autocast(
-        device_type=device.type, dtype=torch.bfloat16, enabled=supports_bfloat16(device)
-    ):
-        out = model.generate(
-            idx,
-            args.max_new_tokens,
-            temperature=args.temperature,
-            top_k=args.top_k,
-            num_valid_tokens=enc.n_vocab,  # never sample the padding ids
-        )
-
-    for i, row in enumerate(out.tolist()):
-        new_tokens = row[len(prompt_tokens) :]
-        # <|endoftext|> starts an unrelated document in the training data, so stop there.
-        if enc.eot_token in new_tokens:
-            new_tokens = new_tokens[: new_tokens.index(enc.eot_token)]
+    texts = generate_text(
+        model,
+        args.prompt,
+        args.num_samples,
+        args.max_new_tokens,
+        temperature=args.temperature,
+        top_k=args.top_k,
+        seed=args.seed,
+    )
+    for i, text in enumerate(texts):
         print(f"\n--- sample {i + 1} ---")
-        print(args.prompt + enc.decode(new_tokens))
+        print(text)
 
 
 if __name__ == "__main__":
